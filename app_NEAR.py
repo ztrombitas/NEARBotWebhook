@@ -1,30 +1,25 @@
 import os
-
 from flask import Flask, request
 import requests
 
 app = Flask(__name__)
 
-# A tokent és a csatorna-ID-t NEM a kódba írjuk (publikus repo lesz),
-# hanem a render.com Dashboardon, Environment Variables alatt adjuk meg.
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-# NEAR/USDT végleges, validált DCA-létra (dev0.7x_w1.2x variáns)
-# Deviáció% az aktuális (jelzéskori) árhoz képest, szintenként
-DCA_DEVIATIONS = [
-    0.0000,   # Target 1
-    -0.0517,  # Target 2
-    -0.1050,  # Target 3
-    -0.1588,  # Target 4
-    -0.2127,  # Target 5
-    -0.2661,  # Target 6
+# Validált dev0.7x_w1.2x DCA-létra (súly% / deviáció%) - NEARUSDT
+DCA_LEVELS = [
+    (0.54, 0.00),
+    (1.37, -5.17),
+    (3.50, -10.50),
+    (9.02, -15.88),
+    (23.49, -21.27),
+    (62.08, -26.61),
 ]
 
-# A Stop csak formai kötelezettség a Cornix parserének (a bot saját Stop
-# funkciója Off-on áll, a védelmet a DCA-létra + margin-kezelés adja) -
-# ezért egy nominális ár kerül a legmélyebb szint alá, biztonsági ráhagyással
-STOP_BUFFER_PCT = 0.05  # 5%-kal a 6. (legmélyebb) szint alá
+TP_PCT = 1.2312
+TRIGGER_PCT = 0.9850
+TRAILING_PCT = 0.4925
 
 EXCHANGES_LIST = "Binance Futures, Bybit USDT, OKX Futures, KuCoin Futures, Bitget Futures, Hyperliquid Futures, BingX Futures"
 LEVERAGE_LINE = "Cross x20"
@@ -35,39 +30,43 @@ def webhook():
     data = request.get_json(force=True)
 
     entry_price = float(data["price"])
-    symbol = data.get("symbol", "NEAR/USDT")
+    symbol = data.get("symbol", "NEARUSDT")
 
-    # Mind a 6 DCA-szint konkrét árának kiszámítása a validált
-    # deviációk alapján, a jelzéskori (TradingView-ból érkező) árhoz képest
-    entry_prices = [
-        round(entry_price * (1 + dev), 6) for dev in DCA_DEVIATIONS
-    ]
+    entry_lines = []
+    for i, (weight_pct, dev_pct) in enumerate(DCA_LEVELS, start=1):
+        price = round(entry_price * (1 + dev_pct / 100), 6)
+        entry_lines.append(f"{i}) {price}")
 
-    # Nominális, formai Stop a legmélyebb szint alatt (Cornix parser miatt
-    # kötelező mező, de a bot Stop=Off állása miatt nem hoz létre tényleges
-    # SL-rendelést belőle)
-    deepest_level = entry_prices[-1]
-    safety_stop = round(deepest_level * (1 - STOP_BUFFER_PCT), 6)
+    # a formális Stop: kulcsszó a Cornix parser miatt kell (a tényleges védelmet
+    # a DCA-létra + margin-kezelés adja, nem ez a stop)
+    safety_stop = round(entry_price * (1 + DCA_LEVELS[-1][1] / 100) * 0.95, 6)
 
-    entry_lines = "\n".join(
-        f"{i+1}) {price}" for i, price in enumerate(entry_prices)
-    )
+    # Explicit TP-ár a nyers Signal-objektumnak, hogy a Cornix háttérrendszere
+    # be nem töltött ("waiting") jelek esetén is tudja auto-zárni a jelet, amint
+    # az ár eléri - anélkül ezek a sosem-nyílt jelek örökre "Open" állapotban
+    # maradnak a csatorna nyitott-jel limitje (Number of Open Signals per Channel)
+    # ellen. A te tényleges trade-ed TP-je továbbra is a Cornix boton belüli
+    # "Personal" beállításból (First Take-Profit Distance) számolódik - ez a sor
+    # csak a jel saját záró-referenciája.
+    tp_price = round(entry_price * (1 + TP_PCT / 100), 6)
 
-    # Nincs Take-Profit és Trailing Configuration a szövegben, mert a
-    # Cornix Signal Boton mindkettő Personal módban van beállítva
-    # (First Take-Profit Distance: 1.53%, Leveraged Trailing: 0.6%/1.2%)
-    # - ezeket a bot magától, a saját konfigurációja alapján alkalmazza.
     message = f"""#{symbol}
 
 Exchanges: {EXCHANGES_LIST}
 
 Leverage: {LEVERAGE_LINE}
 
-Entry:
-{entry_lines}
+Entry Targets:
+{chr(10).join(entry_lines)}
+
+Take-Profit:
+1) {tp_price}
 
 Stop Targets:
 1) {safety_stop}
+
+Trailing Configuration:
+Stop: Percent Below Highest ({TRAILING_PCT}%) - Trigger: Percent ({TRIGGER_PCT}%)
 """
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
