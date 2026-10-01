@@ -1,28 +1,54 @@
 import os
+import logging
+import threading
+
 from flask import Flask, request
 import requests
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app_NEAR")
 
 app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-# Validált dev0.7x_w1.2x DCA-létra (súly% / deviáció%) - NEARUSDT
+# Validált dev0.9x_w1.4x 6-szintes DCA-létra (súly% / deviáció%) - NEARUSDT, TF=10 perc, max.szim=15
+# (2026-09-27-i ÚJ VÉGLEGES beállítás, METODOLOGIA.md §6.8 - NEAR_vegleges_beallitas_20260927.xlsx;
+#  a korábbi dev0.7x_w1.2x / max.szim=5 verziót váltja, amely a friss adaton likvidációt mutatott)
 DCA_LEVELS = [
-    (0.54, 0.00),
-    (1.37, -5.17),
-    (3.50, -10.50),
-    (9.02, -15.88),
-    (23.49, -21.27),
-    (62.08, -26.61),
+    (0.27, 0.00),
+    (0.79, -6.64),
+    (2.36, -13.50),
+    (7.13, -20.42),
+    (21.78, -27.35),
+    (67.67, -34.21),
 ]
 
-TP_PCT = 1.2312
-TRIGGER_PCT = 0.9850
-TRAILING_PCT = 0.4925
+TP_PCT = 1.2578
+TRIGGER_PCT = 1.0062  # nyers érték - a Trigger mezőt a Cornix NEM osztja le a leverage-dzsel
+LEVERAGE = 20
+TRAILING_PCT_RAW = 0.5031  # kívánt effektív (nyers, TP*0.4) Trailing%
+TRAILING_PCT = round(TRAILING_PCT_RAW * LEVERAGE, 4)  # = 10.062 - Cornix mezőbe beírandó érték:
+# a Cornix a Personal Leveraged Trailing Percentet elosztja a trade tényleges
+# leverage-ével, és a végeredményt sosem engedi 0.2% alá (Cornix support
+# hivatalos válasza, 2026.08.17) - ezért itt a nyers effektív érték helyett
+# a nyers*leverage értéket kell beírni/küldeni, hogy az osztás után a kívánt
+# effektív Trailing% jöjjön ki
 
-EXCHANGES_LIST = "Binance Futures, Bybit USDT, OKX Futures, KuCoin Futures, Bitget Futures, Hyperliquid Futures, BingX Futures"
+EXCHANGES_LIST = "Bitget Futures"
 LEVERAGE_LINE = "Cross x20"
+
+
+def send_telegram_message(text):
+    """Háttérszálon fut (SOL/HBAR-javítás) - nem blokkolja a webhook válaszát."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHANNEL_ID, "text": text}, timeout=10)
+        resp.raise_for_status()
+        logger.info("Telegram üzenet elküldve.")
+    except Exception as exc:  # noqa: BLE001 - szándékosan széles, csak logolunk
+        logger.exception("Telegram küldési hiba: %s", exc)
 
 
 @app.route("/webhook", methods=["POST"])
@@ -69,11 +95,24 @@ Trailing Configuration:
 Stop: Percent Below Highest ({TRAILING_PCT}%) - Trigger: Percent ({TRIGGER_PCT}%)
 """
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHANNEL_ID, "text": message})
+    # a Telegram-küldés háttérszálra kerül, hogy a webhook azonnal visszatérjen -
+    # így a TradingView webhook 3 másodperces timeout-ja nem tud hibát dobni még
+    # akkor sem, ha a Telegram API épp lassabban válaszol
+    threading.Thread(target=send_telegram_message, args=(message,), daemon=True).start()
 
-    return {"status": "sent", "telegram_response": resp.json()}, 200
+    return {"status": "accepted"}, 200
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return {
+        "status": "ok",
+        "symbol": "NEARUSDT",
+        "tp_pct": TP_PCT,
+        "trigger_pct": TRIGGER_PCT,
+        "trailing_pct_cornix_field": TRAILING_PCT,
+    }, 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
