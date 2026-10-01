@@ -37,6 +37,33 @@ TRAILING_PCT = round(TRAILING_PCT_RAW * LEVERAGE, 4)  # = 10.062 - Cornix mezőb
 # effektív Trailing% jöjjön ki
 
 EXCHANGES_LIST = "Bitget Futures"
+
+# Bitget élő last price lekérése (2026.10.01-i "Hit profit before entry" javítás):
+# az entry-létrát és a TP-t a webhook beérkezésekor lekért Bitget last price-ból
+# számoljuk, NEM a TradingView gyertyazáró árából - így a két feed közötti eltérés
+# és a feldolgozási késés alatti elmozdulás nem tolja az 1. entry-t a piac alá.
+BITGET_TICKER_URL = "https://api.bitget.com/api/v2/mix/market/ticker"
+BITGET_PRODUCT_TYPE = "USDT-FUTURES"
+BITGET_TIMEOUT_SEC = 1.5  # a TradingView webhook ~3 mp-es timeout-ja miatt rövid
+
+
+def get_bitget_last_price(symbol):
+    """Visszaadja a Bitget USDT-perpetual aktuális last price-át, hiba esetén None-t."""
+    try:
+        resp = requests.get(
+            BITGET_TICKER_URL,
+            params={"symbol": symbol, "productType": BITGET_PRODUCT_TYPE},
+            timeout=BITGET_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("code") != "00000" or not payload.get("data"):
+            logger.warning("Bitget ticker váratlan válasz: %s", payload)
+            return None
+        return float(payload["data"][0]["lastPr"])
+    except Exception as exc:  # noqa: BLE001 - hiba esetén a TV-árra esünk vissza
+        logger.warning("Bitget ticker lekérési hiba (%s): %s", symbol, exc)
+        return None
 LEVERAGE_LINE = "Cross x20"
 
 
@@ -55,8 +82,19 @@ def send_telegram_message(text):
 def webhook():
     data = request.get_json(force=True)
 
-    entry_price = float(data["price"])
+    tv_price = float(data["price"])
     symbol = data.get("symbol", "NEARUSDT")
+
+    bitget_price = get_bitget_last_price(symbol)
+    if bitget_price:
+        entry_price = bitget_price
+        diff_pct = (bitget_price - tv_price) / tv_price * 100
+        logger.info("ÁR-ÖSSZEVETÉS %s | TV close: %s | Bitget last: %s | eltérés: %+.4f%% | forrás: BITGET",
+                    symbol, tv_price, bitget_price, diff_pct)
+    else:
+        entry_price = tv_price
+        logger.info("ÁR-ÖSSZEVETÉS %s | TV close: %s | Bitget last: n/a | forrás: TV (fallback)",
+                    symbol, tv_price)
 
     entry_lines = []
     for i, (weight_pct, dev_pct) in enumerate(DCA_LEVELS, start=1):
@@ -100,7 +138,8 @@ Stop: Percent Below Highest ({TRAILING_PCT}%) - Trigger: Percent ({TRIGGER_PCT}%
     # akkor sem, ha a Telegram API épp lassabban válaszol
     threading.Thread(target=send_telegram_message, args=(message,), daemon=True).start()
 
-    return {"status": "accepted"}, 200
+    return {"status": "accepted", "price_source": "bitget" if bitget_price else "tradingview",
+            "entry_price": entry_price}, 200
 
 
 @app.route("/", methods=["GET"])
